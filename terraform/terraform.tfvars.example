@@ -1,0 +1,18 @@
+# terraform.tfvars.example
+# ─────────────────────────────────────────────────────────────────────────────
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is in .gitignore — never commit it (contains secrets).
+# ─────────────────────────────────────────────────────────────────────────────
+
+location     = "eastus"
+project_name = "selfhealing"
+environment  = "dev"
+
+# Your GitHub Personal Access Token (created in Phase 1 Step 9)
+github_token = "ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# Your GitHub repo: "username/self-healing-pipeline"
+github_repo  = "YOUR_USERNAME/self-healing-pipeline"
+
+# Your GitHub username
+github_owner = "YOUR_USERNAME"
