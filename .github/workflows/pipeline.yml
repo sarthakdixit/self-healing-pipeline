@@ -1,0 +1,206 @@
+name: Self-Healing CI/CD Pipeline
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs on new push to same branch
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  AZURE_WEBAPP_NAME: "app-selfhealing-dev" # must match terraform output
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 1 — LINT
+  # ────────────────────────────────────────────────────────────────────────────
+  lint:
+    name: "① Lint"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install linter
+        run: pip install ruff==0.1.14
+
+      - name: Run ruff
+        run: ruff check app/ tests/
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 2 — TEST
+  # ────────────────────────────────────────────────────────────────────────────
+  test:
+    name: "② Test"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      - name: Run normal tests
+        run: pytest tests/test_api.py -v --tb=short
+
+      - name: Run flaky test
+        run: pytest tests/test_flaky.py -v --tb=short
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 3 — SECURITY
+  # ────────────────────────────────────────────────────────────────────────────
+  security:
+    name: "③ Security"
+    runs-on: ubuntu-latest
+    needs: lint
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install security tools
+        run: pip install bandit==1.7.6 safety==2.3.5
+
+      - name: Run bandit (SAST)
+        run: bandit -r app/ -ll
+
+      - name: Run safety (dependency CVE check)
+        run: safety check -r requirements.txt
+        continue-on-error: true # advisory only — won't block pipeline
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 4 — BUILD
+  # ────────────────────────────────────────────────────────────────────────────
+  build:
+    name: "④ Build"
+    runs-on: ubuntu-latest
+    needs: [test, security]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Verify app starts
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 &
+          sleep 3
+          curl -f http://localhost:8000/ || exit 1
+          kill %1
+
+      - name: Create deployment package
+        run: zip -r deploy.zip . -x "*.git*" "tests/*" "terraform/*" "healing/*" "__pycache__/*"
+
+      - name: Upload deployment artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-package
+          path: deploy.zip
+          retention-days: 1
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 5 — DEPLOY
+  # ────────────────────────────────────────────────────────────────────────────
+  deploy:
+    name: "⑤ Deploy"
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - name: Download deployment artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deploy-package
+
+      - name: Login to Azure
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Deploy to Azure App Service
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          package: deploy.zip
+
+      - name: Verify deployment
+        run: |
+          sleep 10
+          APP_URL=$(az webapp show \
+            --name ${{ env.AZURE_WEBAPP_NAME }} \
+            --resource-group rg-selfhealing-dev \
+            --query defaultHostName -o tsv)
+          curl -f https://$APP_URL/ || exit 1
+          echo "✅ Deployment verified at https://$APP_URL"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # JOB 6 — SELF-HEALING (triggers only on failure of any job above)
+  # ────────────────────────────────────────────────────────────────────────────
+  healing:
+    name: "🔧 Self-Healing"
+    runs-on: ubuntu-latest
+    needs: [lint, test, security, build, deploy]
+
+    # This is the magic — only runs when something above fails
+    if: failure()
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install healing dependencies
+        run: pip install requests PyGithub
+
+      - name: Run healing engine
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          GH_REPO: ${{ secrets.GH_REPO }}
+          GH_OWNER: ${{ secrets.GH_OWNER }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_NAME: ${{ github.workflow }}
+          BRANCH: ${{ github.ref_name }}
+          # Which job failed — passed to classifier
+          FAILED_JOBS: ${{ toJson(needs) }}
+        run: python healing/main.py
